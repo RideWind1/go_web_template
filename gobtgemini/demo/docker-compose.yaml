@@ -1,0 +1,177 @@
+version: '3.8'
+
+services:
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: go-chat-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: go_chat_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+  # Chroma向量数据库
+  chroma:
+    build: ./chroma-custom
+    container_name: go-chat-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+
+  embedding-service:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest   # 我们使用CPU版本，资源消耗较低
+    container_name: chat-embedding-service
+    environment:
+      # 选择一个支持中文的、轻量级的、高质量的开源模型
+      - MODEL_ID=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      - PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+      - PIP_TRUSTED_HOST=mirrors.aliyun.com
+      - HUGGING_FACE_HUB_CLIENT_TIMEOUT=120
+    ports:
+      - "8081:8081" # 将容器的80端口映射到服务器的8081端口，避免与Nginx冲突
+    volumes:
+      - ./huggingface_cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s      # 检查间隔：延长到30秒
+      timeout: 10s       # 超时时间：延长到10秒
+      retries: 10        # 重试次数：增加到10次
+      start_period: 300s # 关键：给予容器300秒（5分钟）的启动宽限期
+    restart: always
+    networks:
+      - chat-network
+
+  # Go Chat Backend应用
+  backend:
+    build:
+      context: ./go-chat-backend
+      dockerfile: Dockerfile
+    container_name: go-chat-backend
+    ports:
+      - "8080:8080" # <--- 添加或修改为这一行
+    environment:
+      # 服务器配置
+      - PORT=8080
+      - GIN_MODE=release
+      
+      # 数据库配置
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=password123
+      - DB_NAME=go_chat_db
+      - DB_SSLMODE=disable
+      
+      # JWT配置
+      - JWT_SECRET=your_super_secret_jwt_key_change_this_in_production
+      - JWT_EXPIRES_HOURS=24
+      
+      # Chroma配置
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - CHROMA_COLLECTION_NAME=chat_memory
+      
+      # LLM API配置（请修改为你的实际API配置）
+      - LLM_API_URL=https://pictureai.pp.ua/v1beta/models/gemini-2.0-flash:generateContent
+      - LLM_API_KEY=AIzaSyB0BToz8pj_TS-ZkqsccG4gnfy7tJm7oUE
+      - LLM_MODEL=gemini-2.0-flash
+      
+      # 日志配置
+      - LOG_LEVEL=info
+      - LOG_FILE=logs/app.log
+    volumes:
+      - app_logs:/root/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+  # React前端应用
+  frontend:
+    build:
+      context: ./chat-frontend
+      dockerfile: Dockerfile
+    container_name: go-chat-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+  # Nginx反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: go-chat-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+
+  # Redis缓存（可选）
+  redis:
+    image: redis:7-alpine
+    container_name: go-chat-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - chat-network
+
+volumes:
+  postgres_data:
+    driver: local
+  chroma_data:
+    driver: local
+  app_logs:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  chat-network:
+    driver: bridge
